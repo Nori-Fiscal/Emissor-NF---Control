@@ -506,13 +506,10 @@ def distribuir_itens(itens: List[ItemPedido], minimo: Decimal, maximo: Decimal) 
         return ResultadoDivisao(False, "Informe uma faixa válida: mínimo maior que zero e menor ou igual ao máximo.", [], [], avisos)
 
     total_geral = sum((item.preco_unitario * Decimal(item.quantidade) for item in itens), Decimal("0")).quantize(MOEDA_Q, rounding=ROUND_HALF_UP)
+    permitir_residual_fora_minimo = total_geral < minimo
     if total_geral < minimo:
-        return ResultadoDivisao(
-            False,
-            f"Total do pedido ({fmt_moeda(total_geral)}) é menor que o mínimo informado ({fmt_moeda(minimo)}).",
-            [],
-            [],
-            avisos,
+        avisos.append(
+            "O total geral é menor que o valor mínimo informado. O sistema gerará 1 pedido residual com o pedido completo."
         )
 
     item_unitario_maior = [item for item in itens if item.preco_unitario > maximo]
@@ -520,21 +517,20 @@ def distribuir_itens(itens: List[ItemPedido], minimo: Decimal, maximo: Decimal) 
         skus = ", ".join(sorted({item.sku for item in item_unitario_maior})[:10])
         return ResultadoDivisao(False, f"Há SKU com preço unitário acima do máximo por pedido/NF: {skus}.", [], [], avisos)
 
-    n_min = ceil_decimal(total_geral, maximo)
+    n_min = max(1, ceil_decimal(total_geral, maximo))
     n_max = floor_decimal(total_geral, minimo)
     if n_min > n_max:
-        return ResultadoDivisao(
-            False,
-            "Não existe uma quantidade de pedidos/NFs que deixe todos os totais dentro da faixa informada. "
-            f"Total geral: {fmt_moeda(total_geral)}; faixa: {fmt_moeda(minimo)} a {fmt_moeda(maximo)}.",
-            [],
-            [],
-            avisos,
+        permitir_residual_fora_minimo = True
+        n = n_min
+        avisos.append(
+            "O total geral não fecha matematicamente com todos os pedidos dentro da faixa. "
+            "Para não travar a operação, o sistema gerará o pedido completo em NFs de melhor encaixe, "
+            "mantendo todos os itens e podendo deixar pedido residual abaixo do mínimo."
         )
-
-    alvo = (minimo + maximo) / Decimal("2")
-    n_sugerido = int((total_geral / alvo).to_integral_value(rounding="ROUND_HALF_UP"))
-    n = max(n_min, min(n_sugerido, n_max))
+    else:
+        alvo = (minimo + maximo) / Decimal("2")
+        n_sugerido = int((total_geral / alvo).to_integral_value(rounding="ROUND_HALF_UP"))
+        n = max(n_min, min(n_sugerido, n_max))
     n = max(1, n)
 
     # Alocação inicial proporcional: preserva preços e quantidades totais.
@@ -562,10 +558,13 @@ def distribuir_itens(itens: List[ItemPedido], minimo: Decimal, maximo: Decimal) 
     max_iter = 50000
     for _ in range(max_iter):
         totais = totais_por_alocacao(alocacao, itens)
-        baixos = [i for i, t in enumerate(totais) if t < minimo]
+        baixos = [] if permitir_residual_fora_minimo else [i for i, t in enumerate(totais) if t < minimo]
         altos = [i for i, t in enumerate(totais) if t > maximo]
         if not baixos and not altos:
-            return ResultadoDivisao(True, f"Divisão concluída em {n} pedido(s)/NF(s).", [dict(x) for x in alocacao], totais, avisos)
+            msg = f"Divisão concluída em {n} pedido(s)/NF(s)."
+            if permitir_residual_fora_minimo:
+                msg = f"Divisão gerada em {n} pedido(s)/NF(s), preservando o pedido completo. Confira pedidos residuais abaixo do mínimo na auditoria."
+            return ResultadoDivisao(True, msg, [dict(x) for x in alocacao], totais, avisos)
 
         movimento = False
 
@@ -631,6 +630,15 @@ def distribuir_itens(itens: List[ItemPedido], minimo: Decimal, maximo: Decimal) 
             break
 
     totais = totais_por_alocacao(alocacao, itens)
+    if permitir_residual_fora_minimo and all(t <= maximo for t in totais):
+        return ResultadoDivisao(
+            True,
+            f"Divisão gerada em {n} pedido(s)/NF(s), preservando o pedido completo. Confira pedidos residuais abaixo do mínimo na auditoria.",
+            [dict(x) for x in alocacao],
+            totais,
+            avisos,
+        )
+
     fora = [fmt_moeda(t) for t in totais if not (minimo <= t <= maximo)]
     return ResultadoDivisao(
         False,
@@ -1076,6 +1084,8 @@ if executar_geracao:
         })
 
         st.success(resultado.mensagem)
+        for aviso in resultado.avisos:
+            st.warning(aviso)
         st.dataframe(resumo, use_container_width=True)
 
         zip_bytes = montar_zip(
