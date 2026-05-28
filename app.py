@@ -39,8 +39,8 @@ CANON_PEDIDO = {
 
 CANON_PRECO = {
     "nome_lista": ["Nome lista", "Lista", "Tabela", "Nome da lista"],
-    "sku": ["SKU", "Código", "Codigo", "Cód. Produto", "Cod Produto"],
-    "preco": ["Preço", "Preco", "Valor", "Valor Unitário", "Valor Unitario"],
+    "sku": ["SKU", "Sku", "Código", "Codigo", "Cód. Produto", "Cod Produto"],
+    "preco": ["Preço", "Preco", "Valor", "Valor Unitário", "Valor Unitario", "R$ Preço da lista", "Preço da lista", "Preco da lista"],
 }
 
 
@@ -76,6 +76,32 @@ def normalizar_texto(valor: object) -> str:
     texto = texto.lower()
     texto = re.sub(r"[^a-z0-9]+", "", texto)
     return texto
+
+
+def normalizar_sku(valor: object) -> str:
+    if valor is None:
+        return ""
+    texto = str(valor).strip().upper()
+    texto = texto.replace("–", "-").replace("—", "-")
+    texto = re.sub(r"\s+", "", texto)
+    return texto
+
+
+def variantes_sku(valor: object) -> List[str]:
+    base = normalizar_sku(valor)
+    if not base:
+        return []
+    variantes = {base}
+    if "," in base:
+        variantes.add(base.replace(",", "."))
+    if "." in base:
+        variantes.add(base.replace(".", ","))
+    return sorted(variantes)
+
+
+def registrar_preco(precos: Dict[str, Decimal], sku: object, preco: Decimal) -> None:
+    for variante in variantes_sku(sku):
+        precos[variante] = preco
 
 
 def mapa_alias(canon: Dict[str, List[str]]) -> Dict[str, str]:
@@ -139,6 +165,51 @@ def localizar_cabecalho(ws, alias_map: Dict[str, str], obrigatorios: Iterable[st
     return melhor_linha or 1, melhor_mapa
 
 
+def carregar_precos_pdf_bling(preco_bytes: bytes) -> Dict[str, Decimal]:
+    """Extrai SKU e R$ Preço da lista do relatório PDF do Bling."""
+    try:
+        import pdfplumber
+    except ImportError as exc:
+        raise ImportError(
+            "Para ler PDF do Bling, inclua pdfplumber no requirements.txt e reinstale as dependências."
+        ) from exc
+
+    precos: Dict[str, Decimal] = {}
+    linhas_lidas = 0
+    padrao_linha = re.compile(
+        r"(?P<sku>[A-Z0-9][A-Z0-9\-\./,]*[A-Z0-9])\s+"
+        r"(?:(?P<gtin>\d{8,14})\s+)?"
+        r"(?P<preco_bling>\d{1,3}(?:\.\d{3})*,\d{2})\s+"
+        r"(?P<preco_lista>\d{1,3}(?:\.\d{3})*,\d{2})\s*$"
+    )
+
+    with pdfplumber.open(BytesIO(preco_bytes)) as pdf:
+        for pagina in pdf.pages:
+            texto = pagina.extract_text(x_tolerance=1, y_tolerance=3) or ""
+            for linha in texto.splitlines():
+                linha = linha.strip()
+                m = padrao_linha.search(linha)
+                if not m:
+                    continue
+                sku = m.group("sku")
+                preco_lista = para_decimal(m.group("preco_lista"), f"preço da lista do SKU {sku}").quantize(PRECO_Q, rounding=ROUND_HALF_UP)
+                registrar_preco(precos, sku, preco_lista)
+                linhas_lidas += 1
+
+    if not precos:
+        raise ValueError(
+            "Não foi possível extrair preços do PDF. Confirme se é o relatório 'Listas de preços' do Bling com as colunas SKU e R$ Preço da lista."
+        )
+    return precos
+
+
+def identificar_tipo_preco(nome_arquivo: str) -> str:
+    nome = (nome_arquivo or "").lower()
+    if nome.endswith(".pdf"):
+        return "pdf"
+    return "xlsx"
+
+
 def listar_abas_e_listas_preco(preco_bytes: bytes) -> Tuple[List[str], List[str]]:
     wb = load_workbook(BytesIO(preco_bytes), data_only=True, read_only=True)
     nomes_listas = set()
@@ -179,7 +250,7 @@ def carregar_precos(preco_bytes: bytes, aba: str, nome_lista: Optional[str]) -> 
         if preco_raw in (None, ""):
             continue
         preco = para_decimal(preco_raw, f"preço do SKU {sku}").quantize(PRECO_Q, rounding=ROUND_HALF_UP)
-        precos[sku] = preco
+        registrar_preco(precos, sku, preco)
 
     if not precos:
         raise ValueError("Nenhum preço válido foi encontrado na lista selecionada.")
@@ -205,7 +276,8 @@ def carregar_itens_pedido(pedido_bytes: bytes, aba: str, precos: Dict[str, Decim
             continue
 
         sku = str(sku_raw).strip()
-        if sku not in precos:
+        sku_chave = normalizar_sku(sku)
+        if sku_chave not in precos:
             pendencias.append({"Linha": row, "SKU": sku, "Problema": "SKU não encontrado na lista de preços selecionada."})
             continue
 
@@ -224,7 +296,7 @@ def carregar_itens_pedido(pedido_bytes: bytes, aba: str, precos: Dict[str, Decim
             continue
 
         quantidade = int(qtd_dec)
-        preco = precos[sku]
+        preco = precos[sku_chave]
         total = (preco * Decimal(quantidade)).quantize(MOEDA_Q, rounding=ROUND_HALF_UP)
         valores_linha = [ws.cell(row, col).value for col in range(1, ws.max_column + 1)]
         itens.append(
@@ -644,7 +716,7 @@ col1, col2 = st.columns(2)
 with col1:
     pedido_file = st.file_uploader("Planilha de pedido padronizada (.xlsx)", type=["xlsx"])
 with col2:
-    preco_file = st.file_uploader("Planilha de preços (.xlsx)", type=["xlsx"])
+    preco_file = st.file_uploader("Lista de preços (.xlsx ou PDF do Bling)", type=["xlsx", "pdf"])
 
 min_col, max_col, suf_col = st.columns([1, 1, 2])
 with min_col:
@@ -669,12 +741,17 @@ if pedido_file:
 
 if preco_file:
     preco_bytes_ui = preco_file.getvalue()
-    abas_preco, nomes_listas = listar_abas_e_listas_preco(preco_bytes_ui)
-    aba_preco = st.selectbox("Aba da lista de preços", abas_preco, index=0)
-    if nomes_listas:
-        opcoes = ["Todas as listas"] + nomes_listas
-        escolha = st.selectbox("Nome da lista de preços", opcoes, index=1 if len(opcoes) > 1 else 0)
-        nome_lista = None if escolha == "Todas as listas" else escolha
+    tipo_preco = identificar_tipo_preco(preco_file.name)
+    if tipo_preco == "xlsx":
+        abas_preco, nomes_listas = listar_abas_e_listas_preco(preco_bytes_ui)
+        aba_preco = st.selectbox("Aba da lista de preços", abas_preco, index=0)
+        if nomes_listas:
+            opcoes = ["Todas as listas"] + nomes_listas
+            escolha = st.selectbox("Nome da lista de preços", opcoes, index=1 if len(opcoes) > 1 else 0)
+            nome_lista = None if escolha == "Todas as listas" else escolha
+    else:
+        aba_preco = "PDF Bling"
+        st.info("PDF identificado. O sistema usará a coluna 'R$ Preço da lista' do relatório do Bling.")
 
 processar = st.button("Gerar pedidos", type="primary", disabled=not (pedido_file and preco_file and aba_pedido and aba_preco))
 
@@ -685,7 +762,10 @@ if processar:
         minimo = para_decimal(valor_min, "valor mínimo").quantize(MOEDA_Q, rounding=ROUND_HALF_UP)
         maximo = para_decimal(valor_max, "valor máximo").quantize(MOEDA_Q, rounding=ROUND_HALF_UP)
 
-        precos = carregar_precos(preco_bytes, aba_preco, nome_lista)
+        if identificar_tipo_preco(preco_file.name) == "pdf":
+            precos = carregar_precos_pdf_bling(preco_bytes)
+        else:
+            precos = carregar_precos(preco_bytes, aba_preco, nome_lista)
         header_row, colmap, itens, pendencias = carregar_itens_pedido(pedido_bytes, aba_pedido, precos)
 
         st.subheader("Conferência inicial")
