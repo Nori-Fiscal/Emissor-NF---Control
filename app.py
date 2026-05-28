@@ -790,12 +790,51 @@ def copiar_estilo(celula_origem, celula_destino) -> None:
         celula_destino.alignment = copy(celula_origem.alignment)
 
 
-def nome_pedido(base: str, seq: int, mascara: str) -> str:
-    base = str(base).strip() if base not in (None, "") else "PEDIDO"
+def _normalizar_numero_base_pedido(base: object) -> str:
+    """Normaliza o número original do pedido preservando zeros à esquerda quando houver."""
+    if base in (None, ""):
+        return "PEDIDO"
+    texto = str(base).strip()
+    # Quando o Excel entrega 37.0, transforma em 37.
     try:
-        return mascara.format(base=base, seq=seq, seq2=f"{seq:02d}", seq3=f"{seq:03d}")
+        dec = Decimal(texto.replace(",", "."))
+        if dec == dec.to_integral_value():
+            return str(int(dec))
     except Exception:
-        return f"{base}-{seq:02d}"
+        pass
+    return texto
+
+
+def numero_pedido_incrementado(base: object, seq: int) -> str:
+    """
+    Gera pedido sequencial a partir do número original.
+    Ex.: base 37 e 3 pedidos -> 37, 38, 39.
+    Ex.: base 00037 -> 00037, 00038, 00039.
+    Para bases não numéricas, mantém a base e adiciona sufixo sequencial.
+    """
+    texto = _normalizar_numero_base_pedido(base)
+    if texto.isdigit():
+        largura = len(texto) if texto.startswith("0") else 0
+        numero = int(texto) + seq - 1
+        return str(numero).zfill(largura) if largura else str(numero)
+    return f"{texto}-{seq:02d}"
+
+
+def nome_pedido(base: str, seq: int, mascara: str) -> str:
+    base_norm = _normalizar_numero_base_pedido(base)
+    pedido_seq = numero_pedido_incrementado(base_norm, seq)
+    mascara = (mascara or "{pedido_seq}").strip()
+    try:
+        return mascara.format(
+            base=base_norm,
+            seq=seq,
+            seq2=f"{seq:02d}",
+            seq3=f"{seq:03d}",
+            pedido_seq=pedido_seq,
+            pedido=pedido_seq,
+        )
+    except Exception:
+        return pedido_seq
 
 
 def gerar_planilha_pedido(
@@ -1063,8 +1102,8 @@ with max_col:
 with suf_col:
     mascara_pedido = st.text_input(
         "Máscara do número do pedido de saída",
-        value="{base}-{seq2}",
-        help="Use {base}, {seq}, {seq2} ou {seq3}. Ex.: {base}-{seq2} gera 37-01, 37-02...",
+        value="{pedido_seq}",
+        help="Use {pedido_seq} para seguir a numeração original. Ex.: pedido 37 com 3 saídas gera 37, 38 e 39. Também aceita {base}, {seq}, {seq2} e {seq3}.",
     )
 
 aba_pedido = st.session_state.get("aba_pedido_mem")
