@@ -498,6 +498,148 @@ def totais_por_alocacao(alocacao: List[Dict[int, int]], itens: List[ItemPedido])
     return totais
 
 
+
+def calcular_alvos_diversificados(total_geral: Decimal, minimo: Decimal, maximo: Decimal, n: int, permitir_residual: bool) -> List[Decimal]:
+    """
+    Monta alvos diferentes para cada pedido/NF.
+
+    A ideia é evitar que a divisão inicial distribua todos os SKUs de forma
+    proporcional e gere totais/quantidades praticamente iguais. Os alvos são
+    usados somente como guia de composição; preço unitário e quantidade total
+    continuam preservados.
+    """
+    if n <= 1:
+        return [total_geral.quantize(MOEDA_Q, rounding=ROUND_HALF_UP)]
+
+    amplitude_faixa = maximo - minimo
+    centavo = Decimal("0.01")
+
+    # Cenário residual: não há como todos ficarem dentro da faixa.
+    # Mantém os primeiros pedidos em valores distintos dentro da faixa e deixa
+    # o último como residual do pedido completo.
+    if permitir_residual:
+        alvos: List[Decimal] = []
+        restante = total_geral
+        for i in range(n - 1):
+            pedidos_restantes = n - i - 1
+            minimo_alvo = max(minimo, restante - (maximo * Decimal(pedidos_restantes)))
+            maximo_alvo = min(maximo, restante - (centavo * Decimal(pedidos_restantes)))
+
+            if maximo_alvo < minimo_alvo:
+                alvo = max(centavo, min(maximo, maximo_alvo))
+            else:
+                if i % 3 == 0:
+                    proporcao = Decimal("0.92")
+                elif i % 3 == 1:
+                    proporcao = Decimal("0.28")
+                else:
+                    proporcao = Decimal("0.63")
+                alvo = minimo + (amplitude_faixa * proporcao)
+                alvo = max(minimo_alvo, min(maximo_alvo, alvo))
+
+            alvo = alvo.quantize(MOEDA_Q, rounding=ROUND_HALF_UP)
+            alvos.append(alvo)
+            restante -= alvo
+
+        alvos.append(restante.quantize(MOEDA_Q, rounding=ROUND_HALF_UP))
+        return alvos
+
+    # Cenário matematicamente viável: cria variação simétrica ao redor da média,
+    # mantendo a soma dos alvos igual ao total geral e respeitando a faixa.
+    base = (total_geral / Decimal(n)).quantize(MOEDA_Q, rounding=ROUND_HALF_UP)
+    folga_baixo = max(Decimal("0"), base - minimo)
+    folga_cima = max(Decimal("0"), maximo - base)
+    amplitude = min(amplitude_faixa * Decimal("0.35"), folga_baixo, folga_cima)
+
+    if amplitude < Decimal("0.01"):
+        amplitude = min(Decimal("25.00"), folga_baixo, folga_cima)
+
+    if amplitude < Decimal("0.01"):
+        return [base for _ in range(n - 1)] + [(total_geral - base * Decimal(n - 1)).quantize(MOEDA_Q, rounding=ROUND_HALF_UP)]
+
+    pesos = []
+    meio = Decimal(n - 1) / Decimal("2")
+    denom = meio if meio != 0 else Decimal("1")
+    for i in range(n):
+        pesos.append((Decimal(i) - meio) / denom)
+
+    # Alterna a ordem para os pedidos não ficarem com uma progressão tão regular.
+    pesos_ordenados = []
+    esquerda = 0
+    direita = len(pesos) - 1
+    while esquerda <= direita:
+        pesos_ordenados.append(pesos[direita])
+        if esquerda != direita:
+            pesos_ordenados.append(pesos[esquerda])
+        esquerda += 1
+        direita -= 1
+
+    alvos = [(base + amplitude * peso).quantize(MOEDA_Q, rounding=ROUND_HALF_UP) for peso in pesos_ordenados[:n]]
+
+    # Ajuste fino de arredondamento no último alvo.
+    diferenca = total_geral - sum(alvos, Decimal("0"))
+    alvos[-1] = (alvos[-1] + diferenca).quantize(MOEDA_Q, rounding=ROUND_HALF_UP)
+
+    # Garante limites após o ajuste fino.
+    for i, alvo in enumerate(alvos):
+        if alvo < minimo:
+            falta = minimo - alvo
+            alvos[i] = minimo
+            for j in range(len(alvos)):
+                if j != i and alvos[j] - falta >= minimo:
+                    alvos[j] -= falta
+                    break
+        elif alvo > maximo:
+            excesso = alvo - maximo
+            alvos[i] = maximo
+            for j in range(len(alvos)):
+                if j != i and alvos[j] + excesso <= maximo:
+                    alvos[j] += excesso
+                    break
+
+    return [a.quantize(MOEDA_Q, rounding=ROUND_HALF_UP) for a in alvos]
+
+
+def alocar_por_alvos(itens: List[ItemPedido], alvos: List[Decimal], maximo: Decimal) -> Tuple[List[Dict[int, int]], List[Decimal]]:
+    """Distribui unidades inteiras guiado por alvos diferentes de valor."""
+    n = len(alvos)
+    alocacao: List[Dict[int, int]] = [defaultdict(int) for _ in range(n)]
+    totais = [Decimal("0") for _ in range(n)]
+
+    itens_ordenados = sorted(itens, key=lambda x: (x.preco_unitario, x.valor_total, x.sku), reverse=True)
+
+    for item in itens_ordenados:
+        restante_qtd = item.quantidade
+        preco = item.preco_unitario
+
+        while restante_qtd > 0:
+            candidatos = []
+            for b in range(n):
+                limite_bucket = min(alvos[b], maximo)
+                espaco = limite_bucket - totais[b]
+                if espaco >= preco:
+                    candidatos.append((espaco, b))
+
+            if candidatos:
+                espaco, bucket = max(candidatos, key=lambda x: (x[0], -x[1]))
+                qtd_add = int((espaco / preco).to_integral_value(rounding="ROUND_FLOOR"))
+                qtd_add = max(1, min(restante_qtd, qtd_add))
+            else:
+                # Se nenhum alvo comporta mais uma unidade, usa o pedido com menor total
+                # que ainda caiba no máximo. Isso preserva o pedido completo sem estourar NF.
+                candidatos2 = [b for b in range(n) if totais[b] + preco <= maximo]
+                if candidatos2:
+                    bucket = min(candidatos2, key=lambda b: (totais[b], b))
+                else:
+                    bucket = min(range(n), key=lambda b: (totais[b], b))
+                qtd_add = 1
+
+            alocacao[bucket][item.indice] += qtd_add
+            totais[bucket] += preco * Decimal(qtd_add)
+            restante_qtd -= qtd_add
+
+    return [dict(x) for x in alocacao], [t.quantize(MOEDA_Q, rounding=ROUND_HALF_UP) for t in totais]
+
 def distribuir_itens(itens: List[ItemPedido], minimo: Decimal, maximo: Decimal) -> ResultadoDivisao:
     avisos: List[str] = []
     if not itens:
@@ -533,25 +675,11 @@ def distribuir_itens(itens: List[ItemPedido], minimo: Decimal, maximo: Decimal) 
         n = max(n_min, min(n_sugerido, n_max))
     n = max(1, n)
 
-    # Alocação inicial proporcional: preserva preços e quantidades totais.
-    alocacao: List[Dict[int, int]] = [defaultdict(int) for _ in range(n)]
-    totais = [Decimal("0") for _ in range(n)]
-
-    # Ordena por maior impacto para balancear melhor desde o início.
-    itens_ordenados = sorted(itens, key=lambda x: (x.preco_unitario, x.valor_total, x.sku), reverse=True)
-    for item in itens_ordenados:
-        base = item.quantidade // n
-        resto = item.quantidade % n
-        if base:
-            for b in range(n):
-                alocacao[b][item.indice] += base
-                totais[b] += item.preco_unitario * Decimal(base)
-        for _ in range(resto):
-            b = min(range(n), key=lambda i: totais[i])
-            alocacao[b][item.indice] += 1
-            totais[b] += item.preco_unitario
-
-    totais = [t.quantize(MOEDA_Q, rounding=ROUND_HALF_UP) for t in totais]
+    # Alocação inicial guiada por alvos diferentes.
+    # Isso evita NFs com valores e quantidades praticamente iguais, preservando
+    # preço unitário, quantidade total e trilha de auditoria.
+    alvos = calcular_alvos_diversificados(total_geral, minimo, maximo, n, permitir_residual_fora_minimo)
+    alocacao, totais = alocar_por_alvos(itens, alvos, maximo)
 
     # Rebalanceamento por movimentação de unidades entre pedidos.
     # Objetivo: manter todos dentro da faixa sem alterar preço unitário nem quantidade total.
@@ -880,8 +1008,8 @@ st.caption("Mantém preço unitário, quantidade total e layout do modelo. Gera 
 with st.expander("Critérios usados pelo sistema", expanded=False):
     st.write(
         "O sistema divide o pedido por composição de itens, sem alterar preço unitário e sem alterar a quantidade total. "
-        "A faixa de valor é validada matematicamente; quando não for possível atingir todos os pedidos dentro do intervalo informado, "
-        "o sistema bloqueia a geração e mostra o motivo."
+        "A distribuição usa alvos diferentes por pedido/NF para evitar totais e quantidades iguais. "
+        "Quando o total geral não permitir que todos os pedidos fiquem dentro da faixa, o sistema mantém o pedido completo e sinaliza o residual na auditoria."
     )
 
 with st.expander("Banco de preços salvo no sistema", expanded=False):
