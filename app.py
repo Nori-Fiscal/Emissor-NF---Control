@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import math
+import os
 import re
+import sqlite3
 import unicodedata
+from datetime import datetime
 from collections import defaultdict
 from copy import copy
 from dataclasses import dataclass
@@ -23,6 +26,11 @@ from openpyxl.utils import get_column_letter
 # ============================================================
 MOEDA_Q = Decimal("0.01")
 PRECO_Q = Decimal("0.0001")
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(APP_DIR, "data")
+DB_PATH = os.path.join(DATA_DIR, "precos_app.sqlite3")
+os.makedirs(DATA_DIR, exist_ok=True)
 
 CANON_PEDIDO = {
     "numero_pedido": ["Número pedido", "Numero pedido", "Pedido", "Nº Pedido", "N Pedido"],
@@ -257,13 +265,14 @@ def carregar_precos(preco_bytes: bytes, aba: str, nome_lista: Optional[str]) -> 
     return precos
 
 
-def carregar_itens_pedido(pedido_bytes: bytes, aba: str, precos: Dict[str, Decimal]) -> Tuple[int, Dict[str, int], List[ItemPedido], List[Dict[str, object]]]:
+def carregar_itens_pedido(pedido_bytes: bytes, aba: str, precos: Dict[str, Decimal], skus_excluidos: Optional[set[str]] = None) -> Tuple[int, Dict[str, int], List[ItemPedido], List[Dict[str, object]]]:
     wb = load_workbook(BytesIO(pedido_bytes), data_only=False, read_only=False)
     ws = wb[aba]
     header_row, colmap = localizar_cabecalho(ws, ALIAS_PEDIDO, ["numero_pedido", "sku", "quantidade"])
 
     itens: List[ItemPedido] = []
     pendencias: List[Dict[str, object]] = []
+    skus_excluidos = skus_excluidos or set()
 
     for row in range(header_row + 1, ws.max_row + 1):
         sku_raw = ws.cell(row, colmap["sku"]).value
@@ -277,6 +286,8 @@ def carregar_itens_pedido(pedido_bytes: bytes, aba: str, precos: Dict[str, Decim
 
         sku = str(sku_raw).strip()
         sku_chave = normalizar_sku(sku)
+        if sku_chave in skus_excluidos:
+            continue
         if sku_chave not in precos:
             pendencias.append({"Linha": row, "SKU": sku, "Problema": "SKU não encontrado na lista de preços selecionada."})
             continue
@@ -312,6 +323,158 @@ def carregar_itens_pedido(pedido_bytes: bytes, aba: str, precos: Dict[str, Decim
         )
 
     return header_row, colmap, itens, pendencias
+
+
+# ============================================================
+# Banco de dados local: fontes, preços manuais e exclusões
+# ============================================================
+def conectar_banco() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def inicializar_banco() -> None:
+    with conectar_banco() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fontes_preco (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nome_arquivo TEXT NOT NULL,
+                tipo TEXT NOT NULL,
+                conteudo BLOB NOT NULL,
+                criado_em TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS precos (
+                sku TEXT PRIMARY KEY,
+                preco TEXT NOT NULL,
+                origem TEXT NOT NULL,
+                atualizado_em TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS skus_excluidos (
+                sku TEXT PRIMARY KEY,
+                motivo TEXT,
+                atualizado_em TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def salvar_fonte_preco(nome_arquivo: str, tipo: str, conteudo: bytes) -> None:
+    with conectar_banco() as conn:
+        conn.execute(
+            "INSERT INTO fontes_preco (nome_arquivo, tipo, conteudo, criado_em) VALUES (?, ?, ?, ?)",
+            (nome_arquivo, tipo, conteudo, datetime.now().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+
+
+def salvar_precos_no_banco(precos: Dict[str, Decimal], origem: str) -> None:
+    agora = datetime.now().isoformat(timespec="seconds")
+    with conectar_banco() as conn:
+        for sku, preco in precos.items():
+            conn.execute(
+                """
+                INSERT INTO precos (sku, preco, origem, atualizado_em) VALUES (?, ?, ?, ?)
+                ON CONFLICT(sku) DO UPDATE SET
+                    preco=excluded.preco,
+                    origem=excluded.origem,
+                    atualizado_em=excluded.atualizado_em
+                """,
+                (normalizar_sku(sku), str(preco.quantize(PRECO_Q, rounding=ROUND_HALF_UP)), origem, agora),
+            )
+        conn.commit()
+
+
+def carregar_precos_do_banco() -> Dict[str, Decimal]:
+    inicializar_banco()
+    precos: Dict[str, Decimal] = {}
+    with conectar_banco() as conn:
+        for sku, preco_txt in conn.execute("SELECT sku, preco FROM precos"):
+            try:
+                registrar_preco(precos, sku, Decimal(str(preco_txt)))
+            except Exception:
+                continue
+    return precos
+
+
+def carregar_skus_excluidos() -> set[str]:
+    inicializar_banco()
+    with conectar_banco() as conn:
+        return {normalizar_sku(row[0]) for row in conn.execute("SELECT sku FROM skus_excluidos")}
+
+
+def salvar_precos_manuais(linhas: List[Dict[str, object]]) -> int:
+    agora = datetime.now().isoformat(timespec="seconds")
+    total = 0
+    with conectar_banco() as conn:
+        for linha in linhas:
+            sku = normalizar_sku(linha.get("SKU"))
+            preco_raw = linha.get("Preço manual")
+            excluir = bool(linha.get("Excluir do pedido"))
+            if not sku:
+                continue
+            if excluir:
+                conn.execute(
+                    """
+                    INSERT INTO skus_excluidos (sku, motivo, atualizado_em) VALUES (?, ?, ?)
+                    ON CONFLICT(sku) DO UPDATE SET motivo=excluded.motivo, atualizado_em=excluded.atualizado_em
+                    """,
+                    (sku, "Excluído manualmente na tela de pendências", agora),
+                )
+                total += 1
+                continue
+            if preco_raw in (None, ""):
+                continue
+            preco = para_decimal(preco_raw, f"preço manual do SKU {sku}").quantize(PRECO_Q, rounding=ROUND_HALF_UP)
+            conn.execute(
+                """
+                INSERT INTO precos (sku, preco, origem, atualizado_em) VALUES (?, ?, ?, ?)
+                ON CONFLICT(sku) DO UPDATE SET
+                    preco=excluded.preco, origem=excluded.origem, atualizado_em=excluded.atualizado_em
+                """,
+                (sku, str(preco), "manual", agora),
+            )
+            conn.execute("DELETE FROM skus_excluidos WHERE sku = ?", (sku,))
+            total += 1
+        conn.commit()
+    return total
+
+
+def listar_fontes_salvas() -> pd.DataFrame:
+    inicializar_banco()
+    with conectar_banco() as conn:
+        rows = conn.execute(
+            "SELECT id, nome_arquivo, tipo, criado_em FROM fontes_preco ORDER BY id DESC LIMIT 20"
+        ).fetchall()
+    return pd.DataFrame(rows, columns=["ID", "Arquivo", "Tipo", "Criado em"])
+
+
+def listar_precos_banco() -> pd.DataFrame:
+    inicializar_banco()
+    with conectar_banco() as conn:
+        rows = conn.execute(
+            "SELECT sku, preco, origem, atualizado_em FROM precos ORDER BY sku"
+        ).fetchall()
+    return pd.DataFrame(rows, columns=["SKU", "Preço", "Origem", "Atualizado em"])
+
+
+def listar_excluidos_banco() -> pd.DataFrame:
+    inicializar_banco()
+    with conectar_banco() as conn:
+        rows = conn.execute(
+            "SELECT sku, motivo, atualizado_em FROM skus_excluidos ORDER BY sku"
+        ).fetchall()
+    return pd.DataFrame(rows, columns=["SKU", "Motivo", "Atualizado em"])
 
 
 # ============================================================
@@ -701,6 +864,7 @@ def montar_zip(
 # Interface Streamlit
 # ============================================================
 st.set_page_config(page_title="Gerador de pedidos desmembrados", layout="wide")
+inicializar_banco()
 
 st.title("Gerador de pedidos desmembrados por faixa de valor")
 st.caption("Mantém preço unitário, quantidade total e layout do modelo. Gera uma trilha de auditoria para conferência.")
@@ -711,6 +875,20 @@ with st.expander("Critérios usados pelo sistema", expanded=False):
         "A faixa de valor é validada matematicamente; quando não for possível atingir todos os pedidos dentro do intervalo informado, "
         "o sistema bloqueia a geração e mostra o motivo."
     )
+
+with st.expander("Banco de preços salvo no sistema", expanded=False):
+    st.caption("As listas importadas e os preços manuais ficam salvos no banco SQLite local do app.")
+    col_b1, col_b2, col_b3 = st.columns(3)
+    with col_b1:
+        st.write("**Fontes importadas**")
+        st.dataframe(listar_fontes_salvas(), use_container_width=True, hide_index=True)
+    with col_b2:
+        st.write("**Preços cadastrados**")
+        df_pre_banco = listar_precos_banco()
+        st.dataframe(df_pre_banco.tail(200), use_container_width=True, hide_index=True)
+    with col_b3:
+        st.write("**SKUs excluídos**")
+        st.dataframe(listar_excluidos_banco(), use_container_width=True, hide_index=True)
 
 col1, col2 = st.columns(2)
 with col1:
@@ -762,11 +940,19 @@ if processar:
         minimo = para_decimal(valor_min, "valor mínimo").quantize(MOEDA_Q, rounding=ROUND_HALF_UP)
         maximo = para_decimal(valor_max, "valor máximo").quantize(MOEDA_Q, rounding=ROUND_HALF_UP)
 
-        if identificar_tipo_preco(preco_file.name) == "pdf":
-            precos = carregar_precos_pdf_bling(preco_bytes)
+        tipo_preco_exec = identificar_tipo_preco(preco_file.name)
+        if tipo_preco_exec == "pdf":
+            precos_upload = carregar_precos_pdf_bling(preco_bytes)
         else:
-            precos = carregar_precos(preco_bytes, aba_preco, nome_lista)
-        header_row, colmap, itens, pendencias = carregar_itens_pedido(pedido_bytes, aba_pedido, precos)
+            precos_upload = carregar_precos(preco_bytes, aba_preco, nome_lista)
+
+        salvar_fonte_preco(preco_file.name, tipo_preco_exec, preco_bytes)
+        salvar_precos_no_banco(precos_upload, f"upload:{preco_file.name}")
+
+        precos = carregar_precos_do_banco()
+        precos.update(precos_upload)
+        skus_excluidos = carregar_skus_excluidos()
+        header_row, colmap, itens, pendencias = carregar_itens_pedido(pedido_bytes, aba_pedido, precos, skus_excluidos)
 
         st.subheader("Conferência inicial")
         total_lido = sum((i.valor_total for i in itens), Decimal("0")).quantize(MOEDA_Q, rounding=ROUND_HALF_UP)
@@ -776,15 +962,44 @@ if processar:
         c3.metric("Pendências", len(pendencias))
 
         if pendencias:
-            st.error("Existem pendências antes da divisão. Corrija a lista de preços ou o pedido e tente novamente.")
+            st.error("Existem pendências antes da divisão. Inclua o preço manual ou marque para excluir o SKU do pedido.")
             df_pend = pd.DataFrame(pendencias)
-            st.dataframe(df_pend, use_container_width=True)
-            st.download_button(
-                "Baixar pendências em Excel",
-                data=gerar_pendencias_xlsx(pendencias),
-                file_name="pendencias_skus.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            df_editor = df_pend.copy()
+            df_editor["Preço manual"] = ""
+            df_editor["Excluir do pedido"] = False
+            editado = st.data_editor(
+                df_editor,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Preço manual": st.column_config.TextColumn(
+                        "Preço manual",
+                        help="Informe no padrão brasileiro, exemplo: 12,63",
+                    ),
+                    "Excluir do pedido": st.column_config.CheckboxColumn(
+                        "Excluir do pedido",
+                        help="Marca o SKU para ser ignorado nas próximas gerações.",
+                    ),
+                },
+                disabled=["Linha", "SKU", "Problema"],
+                key="editor_pendencias",
             )
+            col_p1, col_p2 = st.columns([1, 3])
+            with col_p1:
+                if st.button("Salvar ajustes no banco", type="primary"):
+                    try:
+                        qtd_salva = salvar_precos_manuais(editado.to_dict("records"))
+                        st.success(f"{qtd_salva} ajuste(s) salvo(s). Clique em 'Gerar pedidos' novamente para reprocessar.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.exception(exc)
+            with col_p2:
+                st.download_button(
+                    "Baixar pendências em Excel",
+                    data=gerar_pendencias_xlsx(pendencias),
+                    file_name="pendencias_skus.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
             st.stop()
 
         resultado = distribuir_itens(itens, minimo, maximo)
