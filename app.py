@@ -932,8 +932,9 @@ if preco_file:
         st.info("PDF identificado. O sistema usará a coluna 'R$ Preço da lista' do relatório do Bling.")
 
 processar = st.button("Gerar pedidos", type="primary", disabled=not (pedido_file and preco_file and aba_pedido and aba_preco))
+executar_geracao = processar or st.session_state.pop("reprocessar_apos_ajuste", False)
 
-if processar:
+if executar_geracao:
     try:
         pedido_bytes = pedido_file.getvalue()
         preco_bytes = preco_file.getvalue()
@@ -986,10 +987,11 @@ if processar:
             )
             col_p1, col_p2 = st.columns([1, 3])
             with col_p1:
-                if st.button("Salvar ajustes no banco", type="primary"):
+                if st.button("Salvar ajustes e reprocessar", type="primary"):
                     try:
                         qtd_salva = salvar_precos_manuais(editado.to_dict("records"))
-                        st.success(f"{qtd_salva} ajuste(s) salvo(s). Clique em 'Gerar pedidos' novamente para reprocessar.")
+                        st.success(f"{qtd_salva} ajuste(s) salvo(s). Reprocessando automaticamente...")
+                        st.session_state["reprocessar_apos_ajuste"] = True
                         st.rerun()
                     except Exception as exc:
                         st.exception(exc)
