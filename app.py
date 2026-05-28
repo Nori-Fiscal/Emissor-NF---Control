@@ -892,9 +892,32 @@ with st.expander("Banco de preços salvo no sistema", expanded=False):
 
 col1, col2 = st.columns(2)
 with col1:
-    pedido_file = st.file_uploader("Planilha de pedido padronizada (.xlsx)", type=["xlsx"])
+    pedido_file = st.file_uploader("Planilha de pedido padronizada (.xlsx)", type=["xlsx"], key="upload_pedido")
 with col2:
-    preco_file = st.file_uploader("Lista de preços (.xlsx ou PDF do Bling)", type=["xlsx", "pdf"])
+    preco_file = st.file_uploader("Lista de preços (.xlsx ou PDF do Bling)", type=["xlsx", "pdf"], key="upload_preco")
+
+# Mantém os arquivos e escolhas em memória da sessão.
+# Isso evita que, após clicar em "Salvar ajustes e reprocessar", o Streamlit volte para a tela inicial.
+if pedido_file is not None:
+    st.session_state["pedido_bytes_mem"] = pedido_file.getvalue()
+    st.session_state["pedido_nome_mem"] = pedido_file.name
+
+if preco_file is not None:
+    st.session_state["preco_bytes_mem"] = preco_file.getvalue()
+    st.session_state["preco_nome_mem"] = preco_file.name
+
+pedido_bytes_mem = st.session_state.get("pedido_bytes_mem")
+preco_bytes_mem = st.session_state.get("preco_bytes_mem")
+pedido_nome_mem = st.session_state.get("pedido_nome_mem", "pedido.xlsx")
+preco_nome_mem = st.session_state.get("preco_nome_mem", "lista_precos")
+
+tem_pedido = bool(pedido_bytes_mem)
+tem_preco = bool(preco_bytes_mem)
+
+if tem_pedido and pedido_file is None:
+    st.info(f"Pedido carregado na sessão: {pedido_nome_mem}")
+if tem_preco and preco_file is None:
+    st.info(f"Lista de preços carregada na sessão: {preco_nome_mem}")
 
 min_col, max_col, suf_col = st.columns([1, 1, 2])
 with min_col:
@@ -908,47 +931,66 @@ with suf_col:
         help="Use {base}, {seq}, {seq2} ou {seq3}. Ex.: {base}-{seq2} gera 37-01, 37-02...",
     )
 
-aba_pedido = None
-aba_preco = None
-nome_lista = None
+aba_pedido = st.session_state.get("aba_pedido_mem")
+aba_preco = st.session_state.get("aba_preco_mem")
+nome_lista = st.session_state.get("nome_lista_mem")
 
-if pedido_file:
-    pedido_bytes_ui = pedido_file.getvalue()
-    wb_pedido_ro = load_workbook(BytesIO(pedido_bytes_ui), read_only=True, data_only=True)
-    aba_pedido = st.selectbox("Aba do pedido", wb_pedido_ro.sheetnames, index=0)
+if tem_pedido:
+    wb_pedido_ro = load_workbook(BytesIO(pedido_bytes_mem), read_only=True, data_only=True)
+    sheetnames = wb_pedido_ro.sheetnames
+    idx_aba = sheetnames.index(aba_pedido) if aba_pedido in sheetnames else 0
+    aba_pedido = st.selectbox("Aba do pedido", sheetnames, index=idx_aba)
+    st.session_state["aba_pedido_mem"] = aba_pedido
 
-if preco_file:
-    preco_bytes_ui = preco_file.getvalue()
-    tipo_preco = identificar_tipo_preco(preco_file.name)
+if tem_preco:
+    tipo_preco = identificar_tipo_preco(preco_nome_mem)
     if tipo_preco == "xlsx":
-        abas_preco, nomes_listas = listar_abas_e_listas_preco(preco_bytes_ui)
-        aba_preco = st.selectbox("Aba da lista de preços", abas_preco, index=0)
+        abas_preco, nomes_listas = listar_abas_e_listas_preco(preco_bytes_mem)
+        idx_aba_preco = abas_preco.index(aba_preco) if aba_preco in abas_preco else 0
+        aba_preco = st.selectbox("Aba da lista de preços", abas_preco, index=idx_aba_preco)
+        st.session_state["aba_preco_mem"] = aba_preco
         if nomes_listas:
             opcoes = ["Todas as listas"] + nomes_listas
-            escolha = st.selectbox("Nome da lista de preços", opcoes, index=1 if len(opcoes) > 1 else 0)
+            escolha_atual = nome_lista if nome_lista in nomes_listas else (opcoes[1] if len(opcoes) > 1 else opcoes[0])
+            idx_lista = opcoes.index(escolha_atual) if escolha_atual in opcoes else 0
+            escolha = st.selectbox("Nome da lista de preços", opcoes, index=idx_lista)
             nome_lista = None if escolha == "Todas as listas" else escolha
+            st.session_state["nome_lista_mem"] = nome_lista
+        else:
+            nome_lista = None
+            st.session_state["nome_lista_mem"] = None
     else:
         aba_preco = "PDF Bling"
+        nome_lista = None
+        st.session_state["aba_preco_mem"] = aba_preco
+        st.session_state["nome_lista_mem"] = None
         st.info("PDF identificado. O sistema usará a coluna 'R$ Preço da lista' do relatório do Bling.")
 
-processar = st.button("Gerar pedidos", type="primary", disabled=not (pedido_file and preco_file and aba_pedido and aba_preco))
-executar_geracao = processar or st.session_state.pop("reprocessar_apos_ajuste", False)
+processar = st.button("Gerar pedidos", type="primary", disabled=not (tem_pedido and tem_preco and aba_pedido and aba_preco))
+if processar:
+    st.session_state["processamento_ativo"] = True
+
+executar_geracao = bool(st.session_state.get("processamento_ativo", False)) or bool(st.session_state.pop("reprocessar_apos_ajuste", False))
 
 if executar_geracao:
     try:
-        pedido_bytes = pedido_file.getvalue()
-        preco_bytes = preco_file.getvalue()
+        pedido_bytes = st.session_state.get("pedido_bytes_mem")
+        preco_bytes = st.session_state.get("preco_bytes_mem")
+        if not pedido_bytes or not preco_bytes:
+            st.session_state["processamento_ativo"] = False
+            st.warning("Reenvie o pedido e a lista de preços para continuar.")
+            st.stop()
         minimo = para_decimal(valor_min, "valor mínimo").quantize(MOEDA_Q, rounding=ROUND_HALF_UP)
         maximo = para_decimal(valor_max, "valor máximo").quantize(MOEDA_Q, rounding=ROUND_HALF_UP)
 
-        tipo_preco_exec = identificar_tipo_preco(preco_file.name)
+        tipo_preco_exec = identificar_tipo_preco(preco_nome_mem)
         if tipo_preco_exec == "pdf":
             precos_upload = carregar_precos_pdf_bling(preco_bytes)
         else:
             precos_upload = carregar_precos(preco_bytes, aba_preco, nome_lista)
 
-        salvar_fonte_preco(preco_file.name, tipo_preco_exec, preco_bytes)
-        salvar_precos_no_banco(precos_upload, f"upload:{preco_file.name}")
+        salvar_fonte_preco(preco_nome_mem, tipo_preco_exec, preco_bytes)
+        salvar_precos_no_banco(precos_upload, f"upload:{preco_nome_mem}")
 
         precos = carregar_precos_do_banco()
         precos.update(precos_upload)
